@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Multi-Type Particle Simulation</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; }
+    #matrixGrid {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: #2c003e;
+      color: #fff;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      z-index: 10;
+    }
+    #matrixGrid table {
+      border-collapse: collapse;
+    }
+    #matrixGrid td {
+      border: 1px solid #666;
+      padding: 2px;
+    }
+    #matrixGrid input {
+      width: 50px;
+      background: #400060;
+      color: #fff;
+      border: 1px solid #888;
+    }
+  </style>
+</head>
+<body>
+<div id="matrixGrid"></div>
+<script type="module">
+
+// GLSL shader for computing new velocities based on positions and types
+const velocityFragmentShader = `
+precision highp float;
+
+uniform sampler2D posTexture;
+uniform sampler2D velTexture;
+uniform sampler2D typeTexture;
+uniform float interactionMatrix[100];
+uniform float typeCount;
+uniform float particleCount;
+uniform float texSize;
+uniform float universalRepulsion;
+uniform float interactionRange;
+
+varying vec2 vUv;
+
+vec2 getPosition(float index) {
+  float x = mod(index, texSize);
+  float y = floor(index / texSize);
+  vec2 uv = (vec2(x, y) + 0.5) / texSize;
+  return texture2D(posTexture, uv).xy;
+}
+
+float getType(float index) {
+  float x = mod(index, texSize);
+  float y = floor(index / texSize);
+  vec2 uv = (vec2(x, y) + 0.5) / texSize;
+  return texture2D(typeTexture, uv).r;
+}
+
+void main() {
+  float index = floor(vUv.y * texSize) * texSize + floor(vUv.x * texSize);
+  vec2 selfPos = texture2D(posTexture, vUv).xy;
+  vec2 selfVel = texture2D(velTexture, vUv).xy;
+  float selfType = getType(index);
+
+  vec2 force = vec2(0.0);
+
+  for (float i = 0.0; i < 1000.0; i++) {
+    if (i >= particleCount) break;
+    if (i == index) continue;
+
+    vec2 otherPos = getPosition(i);
+    float otherType = getType(i);
+
+    vec2 delta = otherPos - selfPos;
+    float distSq = dot(delta, delta) + 1.0;
+    float dist = sqrt(distSq);
+    vec2 dir = delta / dist;
+
+    float repulsion = universalRepulsion / distSq;
+
+    float typeIndex = selfType * typeCount + otherType;
+    float attraction = 0.0;
+    if (dist < interactionRange) {
+      float dNorm = dist / interactionRange;
+      attraction = interactionMatrix[int(typeIndex)] * exp(-dNorm * dNorm);
+    }
+
+    force += (attraction - repulsion) * dir;
+  }
+
+  vec2 newVel = selfVel + force * 0.03;
+  newVel *= 0.92;
+  gl_FragColor = vec4(newVel, 0.0, 1.0);
+}`;
+
+// Main simulation module
+// Uses Three.js to simulate and render multiple particle types with dynamic force interactions.
+// Supports user-configurable attraction/repulsion matrix and particle attributes via a GUI.
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.173.0/build/three.module.js';
+
+// GPUComputationRenderer adapted for CDN compatibility
+// Lightweight GPUComputationRenderer: helps perform GPU-based calculations using fragment shaders
+class GPUComputationRenderer {
+  constructor(sizeX, sizeY, renderer) {
+    this.sizeX = sizeX;
+    this.sizeY = sizeY;
+    this.renderer = renderer;
+    this.dtType = THREE.FloatType;
+
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.Camera();
+    this.camera.position.z = 1;
+
+    this.passThruUniforms = {
+      texture: { value: null }
+    };
+
+    this.passThruShader = new THREE.ShaderMaterial({
+      uniforms: this.passThruUniforms,
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D texture;
+        varying vec2 vUv;
+        void main() {
+          gl_FragColor = texture2D(texture, vUv);
+        }
+      `
+    });
+
+    this.mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      this.passThruShader
+    );
+    this.scene.add(this.mesh);
+  }
+
+  createRenderTarget() {
+    return new THREE.WebGLRenderTarget(this.sizeX, this.sizeY, {
+      wrapS: THREE.ClampToEdgeWrapping,
+      wrapT: THREE.ClampToEdgeWrapping,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      format: THREE.RGBAFormat,
+      type: this.dtType,
+      depthBuffer: false
+    });
+  }
+
+  renderTexture(input, output) {
+    this.passThruUniforms.texture.value = input;
+    this.mesh.material = this.passThruShader;
+    this.renderer.setRenderTarget(output);
+    this.renderer.render(this.scene, this.camera);
+    this.renderer.setRenderTarget(null);
+  }
+}
+
+// Your original simulation logic follows
+
+let N = 2000;
+let TYPE_COUNT = 5;
+const COLORS = [0xff5555, 0x55ff55, 0x5555ff, 0xffff55, 0x55ffff, 0xff55ff, 0xffffff]; // Default colors for different particle types
+const UNIVERSAL_REPULSION = .00002;
+const INTERACTION_RANGE = 20;
+const FORCE_CONSTANT = 0.02; // Default force constant for attraction/repulsion
+const UNIVERSAL_CENTERING_FORCE = 0.001; // Default force to center particles around (0, 0)
+
+let positions, velocities, colors, types;
+let scene, camera, renderer, geometry, material, points;
+
+let interactionMatrix;
+const bounds = { x: 300, y: 200 };
+
+// Initializes the particle system: positions, velocities, types, and interactions.
+// Sets up the Three.js scene with Points and OrthographicCamera.
+function initSimulation() {
+  positions = new Float32Array(N * 3);
+  velocities = new Float32Array(N * 2);
+  colors = new Float32Array(N * 3);
+  types = new Uint8Array(N);
+
+  interactionMatrix = [];
+  for (let a = 0; a < TYPE_COUNT; a++) {
+    interactionMatrix[a] = [];
+    for (let b = 0; b < TYPE_COUNT; b++) {
+      interactionMatrix[a][b] = { strength: (Math.random() - 0.5) * FORCE_CONSTANT};
+    }
+  }
+  for (let i = 0; i < N; i++) {
+    const t = Math.floor(Math.random() * TYPE_COUNT);
+    types[i] = t;
+    positions[3 * i] = (Math.random() - 0.5) * bounds.x;
+    positions[3 * i + 1] = (Math.random() - 0.5) * bounds.y;
+    positions[3 * i + 2] = 0;
+    velocities[2 * i] = 0;
+    velocities[2 * i + 1] = 0;
+    const color = new THREE.Color(COLORS[t % COLORS.length]);
+    colors[3 * i] = color.r;
+    colors[3 * i + 1] = color.g;
+    colors[3 * i + 2] = color.b;
+  }
+
+  geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  material = new THREE.PointsMaterial({
+    size: 3,
+    vertexColors: true,
+    sizeAttenuation: false
+  });
+
+  points = new THREE.Points(geometry, material);
+
+  scene = new THREE.Scene();
+  camera = new THREE.OrthographicCamera(-bounds.x, bounds.x, bounds.y, -bounds.y, 0.1, 1000);
+  camera.position.z = 10;
+
+  renderer = new THREE.WebGLRenderer();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  const oldCanvas = document.querySelector('canvas');
+  if (oldCanvas) oldCanvas.remove();
+  document.body.appendChild(renderer.domElement);
+
+  scene.add(points);
+  buildMatrixGrid();
+}
+
+initSimulation();
+
+function resetParticles() {
+  for (let i = 0; i < N; i++) {
+    const t = Math.floor(Math.random() * TYPE_COUNT);
+    types[i] = t;
+    positions[3 * i] = (Math.random() - 0.5) * bounds.x;
+    positions[3 * i + 1] = (Math.random() - 0.5) * bounds.y;
+    positions[3 * i + 2] = 0;
+    velocities[2 * i] = 0;
+    velocities[2 * i + 1] = 0;
+    const color = new THREE.Color(COLORS[t % COLORS.length]);
+    colors[3 * i] = color.r;
+    colors[3 * i + 1] = color.g;
+    colors[3 * i + 2] = color.b;
+  }
+  geometry.attributes.position.needsUpdate = true;
+  geometry.attributes.color.needsUpdate = true;
+}
+
+// Build the GUI matrix grid with particle controls
+function buildMatrixGrid() {
+  const grid = document.getElementById('matrixGrid');
+  grid.innerHTML = '';
+  const table = document.createElement('table');
+
+  const header = document.createElement('tr');
+  const topLeft = document.createElement('td');
+  topLeft.textContent = '→↓';
+  header.appendChild(topLeft);
+  for (let j = 0; j < TYPE_COUNT; j++) {
+    const cell = document.createElement('td');
+    cell.textContent = j;
+    header.appendChild(cell);
+  }
+  table.appendChild(header);
+
+  for (let i = 0; i < TYPE_COUNT; i++) {
+    const row = document.createElement('tr');
+    const label = document.createElement('td');
+    label.textContent = i;
+    row.appendChild(label);
+    for (let j = 0; j < TYPE_COUNT; j++) {
+      const cell = document.createElement('td');
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.value = interactionMatrix[i][j].strength.toFixed(2);
+      input.onchange = (e) => {
+        interactionMatrix[i][j].strength = parseFloat(e.target.value);
+      };
+      cell.appendChild(input);
+      row.appendChild(cell);
+    }
+    table.appendChild(row);
+  }
+
+  const controlRow = document.createElement('tr');
+  const controlCell = document.createElement('td');
+  controlCell.colSpan = TYPE_COUNT + 1;
+  controlCell.innerHTML = `Types: <input id="typeInput" type="number" value="${TYPE_COUNT}" style="width:40px;">
+    Particles: <input id="countInput" type="number" value="${N}" style="width:60px;">
+    Size: <input id="sizeInput" type="number" value="${material ? material.size : 6}" style="width:40px;">
+    <button id="resetButton">Reset</button> <button id="randomizeButton">Randomize Forces</button>`;
+  table.appendChild(controlRow);
+  controlRow.appendChild(controlCell);
+
+  grid.appendChild(table);
+
+  document.getElementById('sizeInput').onchange = (e) => {
+    const size = parseInt(e.target.value);
+    if (material) material.size = size;
+  };
+
+  document.getElementById('resetButton').onclick = () => {
+    resetParticles();
+  };
+
+  document.getElementById('randomizeButton').onclick = () => {
+    for (let i = 0; i < TYPE_COUNT; i++) {
+      for (let j = 0; j < TYPE_COUNT; j++) {
+        interactionMatrix[i][j].strength = (Math.random() - 0.5) * FORCE_CONSTANT;
+      }
+    }
+    buildMatrixGrid();
+    resetParticles();
+  };
+
+  document.getElementById('typeInput').onchange = (e) => {
+    TYPE_COUNT = parseInt(e.target.value);
+    initSimulation();
+  };
+
+  document.getElementById('countInput').onchange = (e) => {
+    N = parseInt(e.target.value);
+    initSimulation();
+  };
+}
+
+// Main animation loop: computes pairwise interactions (O(N²)) for all particles,
+// applies forces based on interaction matrix, updates positions, and renders the scene.
+function animate() {
+  requestAnimationFrame(animate);
+  const pos = geometry.attributes.position.array;
+  for (let i = 0; i < N; i++) {
+    let fx = 0, fy = 0;
+    const xi = pos[3 * i];
+    const yi = pos[3 * i + 1];
+    const ti = types[i];
+    for (let j = 0; j < N; j++) {
+      if (i === j) continue;
+      const xj = pos[3 * j];
+      const yj = pos[3 * j + 1];
+      const tj = types[j];
+      let dx = xj - xi;
+      let dy = yj - yi;
+      let distSq = dx * dx + dy * dy;
+      let dist = Math.sqrt(distSq) + 0.1;
+      let repulsion = -UNIVERSAL_REPULSION * dist;
+      let attraction = 0;
+      if (dist < INTERACTION_RANGE) {
+        const strength = interactionMatrix[ti][tj].strength;
+        attraction = strength * dist;
+      }
+      let force = attraction - repulsion;
+      fx += force * dx / dist;
+      fy += force * dy / dist;
+    }
+    // Central force toward (0, 0)
+    fx += -xi * UNIVERSAL_CENTERING_FORCE;
+    fy += -yi * UNIVERSAL_CENTERING_FORCE;
+    // Update velocities and positions
+    velocities[2 * i] = (velocities[2 * i] + fx * 0.03) * 0.92;
+    velocities[2 * i + 1] = (velocities[2 * i + 1] + fy * 0.03) * 0.92;
+    pos[3 * i] += velocities[2 * i];
+    pos[3 * i + 1] += velocities[2 * i + 1];
+  }
+  geometry.attributes.position.needsUpdate = true;
+  renderer.render(scene, camera);
+}
+animate();
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+    e.preventDefault();
+  }
+});
+</script>
+</body>
+</html>
